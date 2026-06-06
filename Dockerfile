@@ -27,10 +27,4 @@ EXPOSE 8080
 #   -XX:+UseSerialGC  → lowest GC overhead for single-threaded bursts
 #   -XX:MaxMetaspaceSize=96m → cap class-metadata growth (5 heavy decompiler libs)
 #   -Djava.security.egd → faster SecureRandom on Linux; cuts startup time
-ENTRYPOINT ["java",
-  "-Xms64m",
-  "-Xmx350m",
-  "-XX:+UseSerialGC",
-  "-XX:MaxMetaspaceSize=96m",
-  "-Djava.security.egd=file:/dev/./urandom",
-  "-jar", "app.jar"]
+ENTRYPOINT ["java", "-Xms64m", "-Xmx350m", "-XX:+UseSerialGC", "-XX:MaxMetaspaceSize=96m", "-Djava.security.egd=file:/dev/./urandom", "-jar", "app.jar"]
