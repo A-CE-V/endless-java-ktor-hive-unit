@@ -16,18 +16,22 @@ class CfrAdapter : DecompilerAdapter {
         val tmp = File.createTempFile("cfr-class-", ".class")
         try {
             FileOutputStream(tmp).use { it.write(classBytes) }
-            return decompilePath(tmp.absolutePath)
+            // No outputDir → source returned as string
+            return decompilePath(tmp.absolutePath, outputDir = null)
         } finally {
             tmp.delete()
         }
     }
 
+    // FIX: pass outputDir so each class is written as a separate .java file.
+    // Previously outputDir was ignored and all source was concatenated into
+    // result.source — meaning outDir.walkTopDown() found nothing in runChunk().
     override fun decompileJar(jarFile: File, outputDir: File): DecompileResult =
-        decompilePath(jarFile.absolutePath)
+        decompilePath(jarFile.absolutePath, outputDir)
 
     // ── Core decompile logic ──────────────────────────────────────────────────
 
-    private fun decompilePath(path: String): DecompileResult {
+    private fun decompilePath(path: String, outputDir: File?): DecompileResult {
         val source   = StringBuilder()
         val warnings = mutableListOf<String>()
         val errors   = mutableListOf<String>()
@@ -45,9 +49,6 @@ class CfrAdapter : DecompilerAdapter {
                 else -> listOf(OutputSinkFactory.SinkClass.STRING)
             }
 
-            // FIX: Kotlin cannot infer T from the SAM lambda alone when the interface
-            // uses a raw generic. Explicitly type each Sink's lambda parameter so the
-            // compiler knows which erased type to expect, then cast to Sink<T>.
             @Suppress("UNCHECKED_CAST")
             override fun <T> getSink(
                 sinkType: OutputSinkFactory.SinkType,
@@ -58,9 +59,23 @@ class CfrAdapter : DecompilerAdapter {
                 sinkType == OutputSinkFactory.SinkType.JAVA
                         && sinkClass == OutputSinkFactory.SinkClass.DECOMPILED ->
                     OutputSinkFactory.Sink<SinkReturns.Decompiled> { x ->
-                        if (x.packageName.isNotBlank())
-                            source.append("/* Package: ${x.packageName} | Class: ${x.className} */\n")
-                        source.append(x.java).append("\n")
+                        if (outputDir != null) {
+                            // JAR mode: write each class as its own .java file.
+                            // Path: com/example/Foo.java
+                            val relPath = if (x.packageName.isBlank()) {
+                                "${x.className}.java"
+                            } else {
+                                "${x.packageName.replace('.', '/')}/${x.className}.java"
+                            }
+                            val outFile = File(outputDir, relPath)
+                            outFile.parentFile?.mkdirs()
+                            outFile.writeText(x.java)
+                        } else {
+                            // Single .class mode: append to string
+                            if (x.packageName.isNotBlank())
+                                source.append("/* Package: ${x.packageName} | Class: ${x.className} */\n")
+                            source.append(x.java).append("\n")
+                        }
                     } as OutputSinkFactory.Sink<T>
 
                 // ── Informational / warning strings ──────────────────────────

@@ -31,19 +31,23 @@ class VineflowerAdapter : DecompilerAdapter {
         val tempOut = Files.createTempDirectory("vf-out-").toFile()
         try {
             tempIn.writeBytes(classBytes)
-            return run(listOf(tempIn), tempOut)
+            // Single .class mode: outputDir is a temp dir, source returned via saveClassFile
+            return run(listOf(tempIn), tempOut, writeFiles = false)
         } finally {
             tempIn.delete()
             tempOut.deleteRecursively()
         }
     }
 
+    // FIX: pass writeFiles = true so each class entry is written as a separate
+    // .java file in outputDir. Previously saveClassEntry() only appended to
+    // source — meaning outDir.walkTopDown() found nothing in runChunk().
     override fun decompileJar(jarFile: File, outputDir: File): DecompileResult =
-        run(listOf(jarFile), outputDir)
+        run(listOf(jarFile), outputDir, writeFiles = true)
 
     // ── Core logic ────────────────────────────────────────────────────────────
 
-    private fun run(inputs: List<File>, outputDir: File): DecompileResult {
+    private fun run(inputs: List<File>, outputDir: File, writeFiles: Boolean): DecompileResult {
         val source   = StringBuilder()
         val warnings = mutableListOf<String>()
         val errors   = mutableListOf<String>()
@@ -69,8 +73,6 @@ class VineflowerAdapter : DecompilerAdapter {
         val saver = object : IResultSaver {
 
             // ── Called for loose .class files (single-class decompilation) ────
-            // FIX: Vineflower 1.11.x added this method for non-archive results.
-            // Without it the object is not concrete and compilation fails.
             override fun saveClassFile(
                 path: String,
                 qualifiedName: String,
@@ -78,10 +80,14 @@ class VineflowerAdapter : DecompilerAdapter {
                 content: String?,
                 mapping: IntArray?
             ) {
+                // Single .class mode: always append to source string
                 content?.let { source.append(it).append("\n") }
             }
 
-            // ── Called for entries inside a JAR/archive ────────────────────────
+            // ── Called for entries inside a JAR/archive ───────────────────────
+            // FIX: when writeFiles = true (JAR mode), write to outputDir instead
+            // of appending to source. entryName is the relative .java path,
+            // e.g. "com/example/Foo.java" — use it directly as the output path.
             override fun saveClassEntry(
                 path: String,
                 archiveName: String,
@@ -89,16 +95,23 @@ class VineflowerAdapter : DecompilerAdapter {
                 entryName: String,
                 content: String?
             ) {
-                content?.let { source.append(it).append("\n") }
+                content ?: return
+                if (writeFiles) {
+                    val outFile = File(outputDir, entryName)
+                    outFile.parentFile?.mkdirs()
+                    outFile.writeText(content)
+                } else {
+                    source.append(content).append("\n")
+                }
             }
 
-            // ── No-ops for everything we don't need ───────────────────────────
-            override fun saveFolder(path: String)                                                    {}
-            override fun copyFile(source: String, path: String, entryName: String)                  {}
-            override fun createArchive(path: String, archiveName: String, manifest: Manifest?)      {}
-            override fun saveDirEntry(path: String, archiveName: String, entryName: String)         {}
-            override fun copyEntry(source: String, path: String, archiveName: String, entry: String){}
-            override fun closeArchive(path: String, archiveName: String)                            {}
+            // ── No-ops for archive scaffolding ────────────────────────────────
+            override fun saveFolder(path: String)                                                     {}
+            override fun copyFile(source: String, path: String, entryName: String)                   {}
+            override fun createArchive(path: String, archiveName: String, manifest: Manifest?)       {}
+            override fun saveDirEntry(path: String, archiveName: String, entryName: String)          {}
+            override fun copyEntry(source: String, path: String, archiveName: String, entry: String) {}
+            override fun closeArchive(path: String, archiveName: String)                             {}
         }
 
         val decompiler = BaseDecompiler(saver, options, logger)

@@ -162,19 +162,42 @@ fun Application.module() {
         // ── GET /health ───────────────────────────────────────────────────────
         // Public — no auth. Used by the orchestrator for load-aware routing
         // and by Uptime Robot / ping bots to keep the Render dyno awake.
+        //
+        // Memory strategy:
+        //   memoryUsedMb/memoryPct → RSS from /proc/self/status (real container
+        //   memory: heap + metaspace + code cache + native). The orchestrator
+        //   uses this to skip overloaded instances.
+        //   heapUsedMb/heapMaxMb   → JVM heap only, for debugging GC pressure.
         get("/health") {
-            val rt     = Runtime.getRuntime()
-            val usedMb = (rt.totalMemory() - rt.freeMemory()) / 1_048_576L
-            val maxMb  = rt.maxMemory() / 1_048_576L
-            val jobs   = activeJobs.get()
+            val rt         = Runtime.getRuntime()
+            val heapUsedMb = (rt.totalMemory() - rt.freeMemory()) / 1_048_576L
+            val heapMaxMb  = rt.maxMemory() / 1_048_576L
+
+            // VmRSS = actual physical RAM used by this process on Linux.
+            // Includes heap + metaspace + code cache + native buffers.
+            // Falls back to heap estimate if /proc is unavailable.
+            val rssKb: Long = runCatching {
+                java.io.File("/proc/self/status")
+                    .readLines()
+                    .firstOrNull { it.startsWith("VmRSS:") }
+                    ?.let { Regex("(\d+)").find(it)?.groupValues?.get(1)?.toLong() }
+            }.getOrNull() ?: 0L
+
+            val rssMb            = if (rssKb > 0L) rssKb / 1024L else heapUsedMb
+            val containerLimitMb = System.getenv("CONTAINER_MEMORY_MB")?.toLongOrNull() ?: 512L
+            val memoryPct        = if (containerLimitMb > 0) rssMb * 100 / containerLimitMb else 0L
+
+            val jobs = activeJobs.get()
             call.respond(mapOf(
                 "status"         to "ok",
                 "activeJobs"     to jobs,
                 "maxJobs"        to MAX_JOBS,
                 "busy"           to (jobs >= MAX_JOBS),
-                "memoryUsedMb"   to usedMb,
-                "memoryMaxMb"    to maxMb,
-                "memoryPct"      to if (maxMb > 0) usedMb * 100 / maxMb else 0L,
+                "memoryUsedMb"   to rssMb,
+                "memoryMaxMb"    to containerLimitMb,
+                "memoryPct"      to memoryPct,
+                "heapUsedMb"     to heapUsedMb,
+                "heapMaxMb"      to heapMaxMb,
                 "uptimeSeconds"  to (System.currentTimeMillis() - startTimeMs) / 1000L,
                 "timeoutMs"      to TIMEOUT_MS,
                 "decompilers"    to registry.availableDecompilers,
