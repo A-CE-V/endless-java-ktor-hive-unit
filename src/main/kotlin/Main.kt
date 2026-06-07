@@ -180,7 +180,7 @@ fun Application.module() {
                 java.io.File("/proc/self/status")
                     .readLines()
                     .firstOrNull { it.startsWith("VmRSS:") }
-                    ?.let { Regex("(\d+)").find(it)?.groupValues?.get(1)?.toLong() }
+                    ?.let { Regex("""(\d+)""").find(it)?.groupValues?.get(1)?.toLong() }
             }.getOrNull() ?: 0L
 
             val rssMb            = if (rssKb > 0L) rssKb / 1024L else heapUsedMb
