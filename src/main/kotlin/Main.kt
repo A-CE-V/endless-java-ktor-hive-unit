@@ -183,11 +183,12 @@ fun Application.module() {
                     ?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toLong() }
             }.getOrNull() ?: 0L
 
+            
             val rssMb            = if (rssKb > 0L) rssKb / 1024L else heapUsedMb
             val containerLimitMb = System.getenv("CONTAINER_MEMORY_MB")?.toLongOrNull() ?: 512L
             val memoryPct        = if (containerLimitMb > 0) rssMb * 100 / containerLimitMb else 0L
 
-            
+
             val jobs = activeJobs.get()
             call.respond(mapOf(
                 "status"         to "ok",
