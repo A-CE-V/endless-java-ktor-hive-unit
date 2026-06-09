@@ -187,6 +187,7 @@ fun Application.module() {
             val containerLimitMb = System.getenv("CONTAINER_MEMORY_MB")?.toLongOrNull() ?: 512L
             val memoryPct        = if (containerLimitMb > 0) rssMb * 100 / containerLimitMb else 0L
 
+            
             val jobs = activeJobs.get()
             call.respond(mapOf(
                 "status"         to "ok",
