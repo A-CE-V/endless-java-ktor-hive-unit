@@ -1,17 +1,11 @@
 package org.endless.model
 
-// ── Original data class ───────────────────────────────────────────────────────
-// Returned by every DecompilerAdapter implementation.
-// The DecompilerAdapter interface contract depends on this type — do not remove.
 data class DecompileResult(
     val source:   String,
     val warnings: List<String> = emptyList(),
     val errors:   List<String> = emptyList()
 )
 
-// ── Routing outcome (used by DecompilerRegistry + Main.kt) ────────────────────
-// The registry wraps adapter results into this sealed class so Main.kt can
-// distinguish clean success from a thrown exception without try-catch everywhere.
 sealed class DecompileOutcome {
     data class Success(
         val source:   String,
@@ -39,15 +33,36 @@ fun DecompileOutcome.toResponseMap(): Map<String, Any> = when (this) {
     )
 }
 
-// ── Hive models ───────────────────────────────────────────────────────────────
-
+/**
+ * Request body for POST /decompile/chunk — sent by the CF Worker orchestrator.
+ *
+ * Two mutually exclusive source modes:
+ *
+ *   Direct / Hybrid path (file ≤ 5 MB):
+ *     [jarBase64] contains the full JAR base64-encoded.
+ *     [r2Url] is null.
+ *
+ *   R2 path (file > 5 MB):
+ *     [r2Url] is a presigned Cloudflare R2 GET URL.
+ *     [jarBase64] is null.
+ *     This unit downloads the JAR directly from R2.
+ *
+ * Exactly one must be non-null — enforced in [init].
+ */
 data class ChunkRequest(
-    val jarBase64:  String,
+    val jarBase64:  String?,
+    val r2Url:      String?,
     val classes:    List<String>,
     val chunkIndex: Int,
     val jobId:      String,
     val mode:       String = "cfr"
-)
+) {
+    init {
+        require(!jarBase64.isNullOrBlank() || !r2Url.isNullOrBlank()) {
+            "ChunkRequest requires either jarBase64 or r2Url — both are null/blank"
+        }
+    }
+}
 
 data class ChunkRunResult(
     val sources:   Map<String, String>,

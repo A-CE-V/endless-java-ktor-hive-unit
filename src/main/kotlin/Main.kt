@@ -22,7 +22,12 @@ import org.endless.model.DecompileOutcome
 import org.endless.model.toResponseMap
 import org.endless.services.*
 import java.io.File
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 import java.nio.file.Files
+import java.time.Duration
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipEntry
@@ -37,51 +42,44 @@ private val startTimeMs   = System.currentTimeMillis()
 private val MAX_JOBS: Int = System.getenv("MAX_JOBS")?.toIntOrNull() ?: 2
 private val TIMEOUT_MS    = System.getenv("DECOMPILE_TIMEOUT_MS")?.toLongOrNull() ?: 60_000L
 
+// ── Shared HTTP client for R2 downloads ──────────────────────────────────────
+// Used ONLY by the R2 path in /decompile/chunk when req.r2Url is set.
+// One instance shared across all requests — thread-safe, connection-pooled.
+// Java 17 stdlib — no extra dependency needed.
+
+private val r2HttpClient: HttpClient = HttpClient.newBuilder()
+    .connectTimeout(Duration.ofSeconds(30))
+    .followRedirects(HttpClient.Redirect.NORMAL)
+    .build()
+
 // ── Minimal Hello.class (120 bytes, Java 8 bytecode) ─────────────────────────
-// Hand-crafted valid .class file for `public class Hello {}`.
-// Used by GET /warmup to keep the decompiler JIT-compiled between real requests.
-// Re-generating: javac Hello.java && xxd Hello.class
 private val WARMUP_CLASS_BYTES = byteArrayOf(
-    -54, -2, -70, -66,                                    // magic: cafebabe
-    0, 0, 0, 52,                                          // minor=0, major=52 (Java 8)
-    0, 10,                                                // constant pool count: 10 (entries 1-9)
-    7, 0, 2,                                              // #1  Class        → #2
-    1, 0, 5, 72, 101, 108, 108, 111,                      // #2  Utf8         "Hello"
-    7, 0, 4,                                              // #3  Class        → #4
-    1, 0, 16, 106, 97, 118, 97, 47, 108, 97, 110, 103,   // #4  Utf8         "java/lang/Object"
+    -54, -2, -70, -66,
+    0, 0, 0, 52,
+    0, 10,
+    7, 0, 2,
+    1, 0, 5, 72, 101, 108, 108, 111,
+    7, 0, 4,
+    1, 0, 16, 106, 97, 118, 97, 47, 108, 97, 110, 103,
     47, 79, 98, 106, 101, 99, 116,
-    1, 0, 6, 60, 105, 110, 105, 116, 62,                  // #5  Utf8         "<init>"
-    1, 0, 3, 40, 41, 86,                                  // #6  Utf8         "()V"
-    1, 0, 4, 67, 111, 100, 101,                           // #7  Utf8         "Code"
-    12, 0, 5, 0, 6,                                       // #8  NameAndType  #5 #6
-    10, 0, 3, 0, 8,                                       // #9  Methodref    #3.#8
-    0, 33,                                                // access_flags: ACC_PUBLIC | ACC_SUPER
-    0, 1,                                                 // this_class:  #1
-    0, 3,                                                 // super_class: #3
-    0, 0,                                                 // interfaces_count: 0
-    0, 0,                                                 // fields_count: 0
-    0, 1,                                                 // methods_count: 1
-    // method_info: <init>
-    0, 1,                                                 //   access_flags: ACC_PUBLIC
-    0, 5,                                                 //   name_index:   #5
-    0, 6,                                                 //   descriptor_index: #6
-    0, 1,                                                 //   attributes_count: 1
-    // Code attribute
-    0, 7,                                                 //   attribute_name_index: #7 "Code"
-    0, 0, 0, 17,                                          //   attribute_length: 17
-    0, 1,                                                 //   max_stack: 1
-    0, 1,                                                 //   max_locals: 1
-    0, 0, 0, 5,                                           //   code_length: 5
-    42, -73, 0, 9, -79,                                   //   aload_0, invokespecial #9, return
-    0, 0,                                                 //   exception_table_length: 0
-    0, 0,                                                 //   Code attributes_count: 0
-    // class attributes
-    0, 0                                                  // class attributes_count: 0
+    1, 0, 6, 60, 105, 110, 105, 116, 62,
+    1, 0, 3, 40, 41, 86,
+    1, 0, 4, 67, 111, 100, 101,
+    12, 0, 5, 0, 6,
+    10, 0, 3, 0, 8,
+    0, 33,
+    0, 1,
+    0, 3,
+    0, 0,
+    0, 0,
+    0, 1,
+    0, 1, 0, 5, 0, 6, 0, 1,
+    0, 7, 0, 0, 0, 17, 0, 1, 0, 1, 0, 0, 0, 5,
+    42, -73, 0, 9, -79, 0, 0, 0, 0
 )
 
 // ── HMAC auth ─────────────────────────────────────────────────────────────────
 
-/** Verifies HMAC for endpoints with a body (POST). */
 private fun ApplicationCall.verifyHmac(secret: String, rawBody: ByteArray): Boolean {
     val timestamp = request.header("x-auth-timestamp") ?: return false
     val signature = request.header("x-auth-signature") ?: return false
@@ -95,7 +93,6 @@ private fun ApplicationCall.verifyHmac(secret: String, rawBody: ByteArray): Bool
     return mac.doFinal().joinToString("") { "%02x".format(it) } == signature
 }
 
-/** Verifies HMAC for GET endpoints (no body — signs only the timestamp). */
 private fun ApplicationCall.verifyHmacNoBody(secret: String): Boolean {
     val timestamp = request.header("x-auth-timestamp") ?: return false
     val signature = request.header("x-auth-signature") ?: return false
@@ -104,7 +101,6 @@ private fun ApplicationCall.verifyHmacNoBody(secret: String): Boolean {
     val mac = Mac.getInstance("HmacSHA256").apply {
         init(SecretKeySpec(secret.toByteArray(Charsets.UTF_8), "HmacSHA256"))
         update(timestamp.toByteArray(Charsets.UTF_8))
-        // No body update — matches Worker's buildHmacHeaders(key, emptyByteArray)
     }
     return mac.doFinal().joinToString("") { "%02x".format(it) } == signature
 }
@@ -115,7 +111,6 @@ private suspend fun ApplicationCall.respondUnauthorized(msg: String) =
 
 // ── Capacity guard ────────────────────────────────────────────────────────────
 
-/** Returns true and sends 503 if the instance is already at max concurrent jobs. */
 private suspend fun ApplicationCall.respondBusy(): Boolean {
     if (activeJobs.get() >= MAX_JOBS) {
         respond(HttpStatusCode.ServiceUnavailable, mapOf(
@@ -127,6 +122,27 @@ private suspend fun ApplicationCall.respondBusy(): Boolean {
         return true
     }
     return false
+}
+
+// ── R2 download ───────────────────────────────────────────────────────────────
+// Downloads a JAR from a Cloudflare R2 presigned GET URL.
+// Called only when ChunkRequest.r2Url is set (files > 5 MB).
+// Runs in Dispatchers.IO — never blocks Netty's event loop.
+
+private suspend fun downloadFromR2(url: String): ByteArray = withContext(Dispatchers.IO) {
+    val req = HttpRequest.newBuilder()
+        .uri(URI.create(url))
+        .timeout(Duration.ofSeconds(90))
+        .GET()
+        .build()
+
+    val res = r2HttpClient.send(req, HttpResponse.BodyHandlers.ofByteArray())
+
+    if (res.statusCode() != 200) {
+        throw RuntimeException("R2 download failed — HTTP ${res.statusCode()}")
+    }
+
+    res.body()
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -160,22 +176,11 @@ fun Application.module() {
     routing {
 
         // ── GET /health ───────────────────────────────────────────────────────
-        // Public — no auth. Used by the orchestrator for load-aware routing
-        // and by Uptime Robot / ping bots to keep the Render dyno awake.
-        //
-        // Memory strategy:
-        //   memoryUsedMb/memoryPct → RSS from /proc/self/status (real container
-        //   memory: heap + metaspace + code cache + native). The orchestrator
-        //   uses this to skip overloaded instances.
-        //   heapUsedMb/heapMaxMb   → JVM heap only, for debugging GC pressure.
         get("/health") {
             val rt         = Runtime.getRuntime()
             val heapUsedMb = (rt.totalMemory() - rt.freeMemory()) / 1_048_576L
             val heapMaxMb  = rt.maxMemory() / 1_048_576L
 
-            // VmRSS = actual physical RAM used by this process on Linux.
-            // Includes heap + metaspace + code cache + native buffers.
-            // Falls back to heap estimate if /proc is unavailable.
             val rssKb: Long = runCatching {
                 java.io.File("/proc/self/status")
                     .readLines()
@@ -183,11 +188,9 @@ fun Application.module() {
                     ?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toLong() }
             }.getOrNull() ?: 0L
 
-            
             val rssMb            = if (rssKb > 0L) rssKb / 1024L else heapUsedMb
             val containerLimitMb = System.getenv("CONTAINER_MEMORY_MB")?.toLongOrNull() ?: 512L
             val memoryPct        = if (containerLimitMb > 0) rssMb * 100 / containerLimitMb else 0L
-
 
             val jobs = activeJobs.get()
             call.respond(mapOf(
@@ -208,11 +211,6 @@ fun Application.module() {
         }
 
         // ── GET /warmup ───────────────────────────────────────────────────────
-        // Called every 4 minutes by the Cloudflare Worker cron trigger.
-        // Decompiles a tiny built-in Hello.class using CFR.
-        // Goal: keep the decompiler JIT paths warm between real user requests.
-        // Auth: HMAC on timestamp only (no body).
-        // NOT counted as an activeJob — it's fast (~200ms) and purely internal.
         get("/warmup") {
             if (!call.verifyHmacNoBody(secret)) {
                 call.respondUnauthorized("Invalid or expired HMAC signature"); return@get
@@ -346,7 +344,6 @@ fun Application.module() {
                         .toString()
                 )
                 call.respondBytes(zipBytes, ContentType.Application.Zip, HttpStatusCode.OK)
-
             } catch (e: TimeoutCancellationException) {
                 call.respond(HttpStatusCode.GatewayTimeout, mapOf(
                     "status" to "error", "error" to "TIMEOUT",
@@ -357,7 +354,6 @@ fun Application.module() {
                     "status" to "error", "error" to "DECOMPILE_FAILED", "detail" to e.message
                 ))
             } finally {
-                // BUG FIX: always cleans up, even on exception or timeout
                 tempJar.delete()
                 outDir.deleteRecursively()
                 activeJobs.decrementAndGet()
@@ -365,9 +361,20 @@ fun Application.module() {
         }
 
         // ── POST /decompile/chunk ─────────────────────────────────────────────
-        // Hive endpoint called by the Cloudflare Worker orchestrator.
-        // Receives the full JAR (base64) + list of class names to decompile.
-        // Builds a mini-JAR from only those classes and runs the decompiler.
+        // Hive endpoint called by the CF Worker orchestrator.
+        //
+        // Two source modes (see ChunkRequest for full docs):
+        //
+        //   Direct / Hybrid path (file ≤ 5 MB):
+        //     req.jarBase64 is set. Decode and process in memory.
+        //     This is the same as the original behaviour.
+        //
+        //   R2 path (file > 5 MB):
+        //     req.r2Url is set — a Cloudflare R2 presigned GET URL.
+        //     This unit downloads the full JAR directly from R2.
+        //     The CF Worker never held the file bytes.
+        //
+        // Both paths converge at registry.runChunk() — identical from there.
         post("/decompile/chunk") {
             val rawBody = call.receive<ByteArray>()
             if (!call.verifyHmac(secret, rawBody)) {
@@ -378,7 +385,7 @@ fun Application.module() {
             val req = runCatching { call.receive<ChunkRequest>() }.getOrElse {
                 call.respond(HttpStatusCode.BadRequest, mapOf(
                     "error"   to "BAD_REQUEST",
-                    "message" to "Invalid JSON — required fields: jarBase64, classes, chunkIndex, jobId"
+                    "message" to "Invalid JSON — required: classes, chunkIndex, jobId, and either jarBase64 or r2Url"
                 ))
                 return@post
             }
@@ -389,10 +396,39 @@ fun Application.module() {
                 return@post
             }
 
-            val jarBytes = runCatching { Base64.getDecoder().decode(req.jarBase64) }.getOrElse {
-                call.respond(HttpStatusCode.BadRequest,
-                    mapOf("error" to "INVALID_BASE64", "message" to "jarBase64 could not be decoded"))
-                return@post
+            // ── Resolve JAR bytes from whichever source is provided ───────────
+            val jarBytes: ByteArray = when {
+
+                // R2 path: download the full JAR from Cloudflare R2
+                !req.r2Url.isNullOrBlank() -> {
+                    runCatching {
+                        downloadFromR2(req.r2Url)
+                    }.getOrElse { ex ->
+                        call.respond(HttpStatusCode.BadGateway, mapOf(
+                            "error"   to "R2_DOWNLOAD_FAILED",
+                            "message" to "Could not download JAR from R2: ${ex.message}"
+                        ))
+                        return@post
+                    }
+                }
+
+                // Direct / Hybrid path: decode base64 JAR from request body
+                !req.jarBase64.isNullOrBlank() -> {
+                    runCatching { Base64.getDecoder().decode(req.jarBase64) }.getOrElse {
+                        call.respond(HttpStatusCode.BadRequest,
+                            mapOf("error" to "INVALID_BASE64", "message" to "jarBase64 could not be decoded"))
+                        return@post
+                    }
+                }
+
+                // Should never happen — ChunkRequest.init validates this
+                else -> {
+                    call.respond(HttpStatusCode.BadRequest, mapOf(
+                        "error"   to "MISSING_SOURCE",
+                        "message" to "Either r2Url or jarBase64 must be provided"
+                    ))
+                    return@post
+                }
             }
 
             registry.validateJarBytes(jarBytes, req.mode)?.let {
