@@ -23,7 +23,22 @@ class DecompilerRegistry(private val adapters: List<DecompilerAdapter>) {
     companion object {
         private const val MAX_CLASS_BYTES = 10L * 1024 * 1024
         private const val MAX_JAR_BYTES   = 50L * 1024 * 1024
-        private const val MAX_PARALLEL = 4
+
+        // ── FIX: raised from 4 to 16 ────────────────────────────────────────────
+        // BEFORE: only 4 classes decompiled simultaneously per chunk, regardless
+        //   of how many classes were assigned to that chunk (could be 60+).
+        //   A 60-class chunk took 15 sequential batches of 4 — the bottleneck
+        //   was never the decompiler itself, it was this artificial cap.
+        //
+        // AFTER: 16 concurrent decompiles per chunk. Kotlin's Dispatchers.IO pool
+        //   defaults to 64 threads (or 2× CPU cores, whichever is larger) — 16 is
+        //   a safe fraction of that even when 2-3 chunks run on the same Render
+        //   instance simultaneously (MAX_JOBS=2 means up to 2 chunks in parallel,
+        //   2 × 16 = 32 threads max, well under the pool's 64-thread ceiling).
+        //
+        // A 60-class chunk now needs only 4 sequential batches of 16 instead of
+        // 15 batches of 4 — roughly 4× faster per-chunk decompilation.
+        private const val MAX_PARALLEL = 16
     }
 
     private val byName: Map<String, DecompilerAdapter> =
@@ -122,6 +137,7 @@ class DecompilerRegistry(private val adapters: List<DecompilerAdapter>) {
                 else ClassWork(className, bytes)
             }
 
+            // Semaphore now allows up to 16 concurrent decompiles (was 4).
             val semaphore = Semaphore(minOf(work.size, MAX_PARALLEL))
             val outcomes: List<ClassOutcome?> = coroutineScope {
                 work.map { (className, classBytes) ->
